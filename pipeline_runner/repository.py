@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import TypeVar, cast
 
 from .config import config
@@ -69,24 +70,89 @@ class RepositoryCloner:
             runner.stop()
 
     def _get_clone_script(self) -> list[str]:
-        origin = self._get_origin()
-        git_clone_cmd = self._get_clone_command(origin)
-
+        # Check if we're in a submodule and adjust the workspace path accordingly
+        workspace_path = config.remote_workspace_dir
+        
+        # If we have a parent repository path from environment, use it
+        parent_repo_path = os.environ.get('PIPELINE_RUNNER_PARENT_REPO_PATH')
+        if parent_repo_path:
+            workspace_path = parent_repo_path
+        
         return [
-            git_clone_cmd,
-            "git reset --hard $BITBUCKET_COMMIT",
+            # First, let's see what's in the workspace
+            f"echo 'Contents of workspace {workspace_path}:'",
+            f"ls -la {workspace_path}",
+            # Copy the repository from host to container
+            f"cp -r {workspace_path} $BUILD_DIR",
+            # Copy the .git file from the submodule if it exists
+            f"echo 'Checking for .git file in current workspace...'",
+            f"if [ -f {workspace_path}/.git ]; then",
+            f"  echo 'Found .git file at: {workspace_path}/.git'",
+            f"  echo 'This is a submodule .git file, removing it to let git handle it properly'",
+            f"  rm -f $BUILD_DIR/.git",
+            "else",
+            f"  echo 'No .git file found in current workspace'",
+            "fi",
+            # Initialize a git repository if we don't have one
+            "if [ ! -d $BUILD_DIR/.git ]; then",
+            "  echo 'Initializing git repository...'",
+            "  cd $BUILD_DIR",
+            "  git init",
+            "  git config user.name bitbucket-pipelines",
+            "  git config user.email commits-noreply@bitbucket.org",
+            "  git add .",
+            "  git commit -m 'Initial commit'",
+            "  echo 'Creating initial commit...'",
+            "else",
+            "  echo 'Repository already exists, resetting...'",
+            "  cd $BUILD_DIR",
+            "  git add .",
+            "  git commit -m 'Update commit'",
+            "fi",
+            "cd $BUILD_DIR",
+            # Create initial commit first
+            "echo 'Creating initial commit...'",
+            "git add .",
+            "if git diff --cached --quiet; then",
+            "  echo 'No changes to commit, working tree is clean'",
+            "else",
+            "  git commit -m 'Initial commit'",
+            "  echo 'Initial commit created'",
+            "fi",
             "git config user.name bitbucket-pipelines",
             "git config user.email commits-noreply@bitbucket.org",
             "git config push.default current",
             # TODO: "git config http.${BITBUCKET_GIT_HTTP_ORIGIN}.proxy http://localhost:29418/",
-            f"git remote set-url origin {origin}",
+            # Only set remote if it doesn't exist or if we have a different URL
+            "if git remote get-url origin >/dev/null 2>&1; then",
+            f"  git remote set-url origin file://{workspace_path}",
+            "  echo 'Updated existing remote origin'",
+            "else",
+            f"  git remote add origin file://{workspace_path}",
+            "  echo 'Added remote origin'",
+            "fi",
             "git reflog expire --expire=all --all",
             "echo '.bitbucket/pipelines/generated' >> .git/info/exclude",
+            # Initialize and update submodules if they exist
+            "if [ -f .gitmodules ]; then",
+            "  git submodule update --init --recursive",
+            "fi",
         ]
 
     @staticmethod
     def _get_origin() -> str:
         # https://x-token-auth:$REPOSITORY_OAUTH_ACCESS_TOKEN@bitbucket.org/$BITBUCKET_REPO_FULL_NAME.git
+        
+        # First, check if we have a parent repository path from environment
+        parent_repo_path = os.environ.get('PIPELINE_RUNNER_PARENT_REPO_PATH')
+        if parent_repo_path:
+            return f"file://{parent_repo_path}"
+        
+        # Then try to detect it automatically
+        if hasattr(self, '_parent_repo_path') and self._parent_repo_path:
+            return f"file://{self._parent_repo_path}"
+        
+        # Default to the configured workspace directory
         return f"file://{config.remote_workspace_dir}"
 
     def _get_clone_command(self, origin: str) -> str:
